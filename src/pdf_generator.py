@@ -2,6 +2,11 @@ from fpdf import FPDF
 import os
 import arabic_reshaper
 import bidi.algorithm
+import logging # Import logging
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 class ArabicPDF(FPDF):
     def __init__(self):
@@ -13,12 +18,21 @@ class ArabicPDF(FPDF):
         self.add_font('NotoSansArabic', '', noto_regular_path, uni=True)
         self.add_font('NotoSansArabic', 'B', noto_bold_path, uni=True)
 
+        # Register Noto Sans (Latin) fonts for comprehensive English/Latin support
+        noto_latin_regular_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fonts', 'NotoSans-Regular.ttf')
+        noto_latin_bold_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fonts', 'NotoSans-Bold.ttf')
+
+        self.add_font('NotoSans', '', noto_latin_regular_path, uni=True)
+        self.add_font('NotoSans', 'B', noto_latin_bold_path, uni=True)
+
+
 def generate_pdf(articles, output_path):
     """
     Generate a PDF file containing the scraped articles.
 
     Args:
-        articles (dict): Dictionary of articles with their titles and content
+        articles (dict): Dictionary of articles with their titles, content,
+                         and English translations.
         output_path (str): Path where the PDF should be saved
     """
     # Ensure fonts directory exists (already handled by the font download commands)
@@ -32,10 +46,18 @@ def generate_pdf(articles, output_path):
         print(f"Fonts directory: {fonts_dir}")
         return
 
+    # Check if Noto Sans (Latin) fonts exist
+    if not os.path.exists(os.path.join(fonts_dir, 'NotoSans-Regular.ttf')) or \
+       not os.path.exists(os.path.join(fonts_dir, 'NotoSans-Bold.ttf')):
+        print("Noto Sans (Latin) fonts not found. Please download them using the provided curl commands.")
+        print(f"Fonts directory: {fonts_dir}")
+        return
+
     # Create PDF with adjusted margins
     pdf = ArabicPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.set_margins(20, 20, 20)  # Left, Top, Right margins
+    page_width = pdf.w - 40  # Total usable width (page width minus margins)
 
     for url, article in articles.items():
         pdf.add_page()
@@ -47,21 +69,29 @@ def generate_pdf(articles, output_path):
         reshaped_content = arabic_reshaper.reshape(article['content'])
         bidi_content = bidi.algorithm.get_display(reshaped_content)
 
-        # Arabic title
-        pdf.set_font('NotoSansArabic', 'B', 24) # Using Noto Sans Arabic Bold for title
+        # Arabic title - Centered
+        pdf.set_font('NotoSansArabic', 'B', 24)
         pdf.set_text_color(0, 0, 0)
-        pdf.multi_cell(160, 15, bidi_title, align='R')
+        pdf.multi_cell(page_width, 15, bidi_title, align='C')
 
-        # English title
-        pdf.set_font('NotoSansArabic', 'B', 18) # Using Noto Sans Arabic Bold for English title
-        pdf.multi_cell(160, 12, article['title_english'], align='L')
+        # English title - Centered, reduced font size, increased height
+        pdf.set_font('NotoSans', 'B', 16) # Changed to NotoSans Bold
+        pdf.set_x(pdf.l_margin) # Explicitly set X to the left margin before rendering the English title
+        pdf.multi_cell(page_width, 15, article['title_english'], align='C')
 
         # Add some space
         pdf.ln(5)
 
         # Arabic content
-        pdf.set_font('NotoSansArabic', '', 16) # Using Noto Sans Arabic Regular for content
-        pdf.multi_cell(160, 10, bidi_content, align='R')
+        pdf.set_font('NotoSansArabic', '', 16)
+        pdf.multi_cell(page_width, 10, bidi_content, align='R')
+
+        # Add space between Arabic and English content
+        pdf.ln(10)
+
+        # English content
+        pdf.set_font('NotoSans', '', 14) # Changed to NotoSans Regular
+        pdf.multi_cell(page_width, 8, article['content_english'], align='L')
 
         # Add space between articles
         pdf.ln(15)

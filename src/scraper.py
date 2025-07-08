@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import aiohttp
 import json
 import logging
@@ -6,16 +6,24 @@ from bs4 import BeautifulSoup
 import os
 from google import genai
 import asyncio
-from utils import extract_base_url
+from src.utils import extract_base_url # Changed to absolute import
 from urllib.parse import urljoin
+from dotenv import load_dotenv
+from tqdm.asyncio import tqdm
+from src import config # This remains correct
 
-GEMINI_API_KEY = "AIzaSyCV_cf8q-9BKY-19u-eb6zSKA9Wdq3_m7Q"
-API_MODEL = "gemini-1.5-pro"
+# Load environment variables from .env file
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
+# Ensure API key is available before initializing geminiClient
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found. Please set it in your .env file or environment variables.")
+
 geminiClient = genai.Client()
 
 class ArabicScraper:
@@ -40,90 +48,127 @@ class ArabicScraper:
 
     async def fetch_page(self, url: str) -> str:
         """
-        Fetch the HTML content of a page.
+        Fetch the markdown content of a page via Jina AI.
         """
         if not self.session:
             raise RuntimeError("Session not initialized. Use async with.")
-        async with self.session.get(url) as response:
-            response.raise_for_status()
-            return await response.text()
+        jina_url = f"{config.JINA_AI_PREFIX}{url}" # Use JINA_AI_PREFIX from config
+        logger.info(f"Fetching via Jina AI: {jina_url}")
+        try:
+            async with self.session.get(jina_url, timeout=30) as response: # Added timeout
+                response.raise_for_status() # Raise an exception for bad status codes
+                return await response.text() # This will be markdown
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error fetching {jina_url}: {e}")
+            raise
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching {jina_url}")
+            raise
 
-    async def extract_text(self, html: str) -> List[str]:
-        """
-        Extract Arabic text segments from HTML.
-        """
-        soup = BeautifulSoup(html, 'html.parser')
-        for script in soup(["script", "style"]):
-            script.decompose()
-        text_segments = []
-        for text in soup.stripped_strings:
-            if any('\u0600' <= char <= '\u06FF' for char in text):
-                text_segments.append(text.strip())
-        return text_segments
-
-    async def extract_links_in_section(self, html: str, section_selector: str, base_url: Optional[str] = None) -> List[str]:
-      """
-      Extract all links (full URLs) within a given section specified by a CSS selector.
-
-      Args:
-        html (str): The HTML content to parse.
-        section_selector (str): CSS selector for the section to search within.
-        base_url (Optional[str]): Base URL to resolve relative links. If not provided, relative links are skipped.
-
-      Returns:
-        List[str]: List of full URLs found in the section.
-      """
-      soup = BeautifulSoup(html, 'html.parser')
-      links = []
-      section = soup.select_one(section_selector)
-      if not section:
-        return []
-      for a in section.find_all('a', href=True):
-        href = a['href']
-        if href.startswith('http'):
-          links.append(href)
-        elif base_url:
-          links.append(urljoin(base_url, href))
-      return list(set(links))
-
-    async def extract_next_page_link(self, html: str, next_page_selector:str, base_url: Optional[str] = None) -> Optional[str]:
-        """
-        Extract the next page link from the pagination section.
-        """
-        soup = BeautifulSoup(html, 'html.parser')
-        next_link = soup.select_one(next_page_selector)
-        if next_link and next_link.get('href'):
-            href = next_link['href']
-            if href.startswith('http'):
-                return href
-            else:
-                return base_url + href
-        return None
-
-async def filter_article_with_gemini(text_segments: List[str]) -> Optional[Dict[str, str]]:
+async def extract_links_from_markdown_with_gemini(markdown_content: str, current_page_url: str) -> List[str]:
     """
-    Use Gemini API to extract the article title and content from the scraped text.
-
-    Args:
-        text_segments (List[str]): List of text segments from the article.
-
-    Returns:
-        Optional[Dict[str, str]]: Dictionary with 'title' and 'content', or None on failure.
+    Use Gemini API to extract article links from markdown content.
     """
     prompt = (
-        "Given the following list of text segments from a web page, "
-        "extract only the article title and the main article content. Translate the article title to English"
-        "Return your answer as a JSON object with keys 'title', 'title_english' and 'content'.\n\n"
-        f"Segments: {json.dumps(text_segments, ensure_ascii=False)}"
+        "Given the following markdown content of a web page, identify and extract all relevant article links. "
+        "These links typically lead to individual articles or lessons. "
+        "Return your answer as a JSON array of full URLs. "
+        "If a link is relative, resolve it using the current page URL. "
+        "Example: ['https://example.com/article1', 'https://example.com/article2']\n\n"
+        f"Markdown Content:\n{markdown_content}"
     )
-
-    # google-genai is synchronous, so run in a thread to avoid blocking
     loop = asyncio.get_running_loop()
     try:
         response = await loop.run_in_executor(
             None,
             lambda: geminiClient.models.generate_content(
-                model=API_MODEL,
+                model=config.API_MODEL, # Use API_MODEL from config
+                contents=prompt
+            )
+        )
+        response_text = response.text.strip()
+        if response_text.startswith("```") and response_text.endswith("```"):
+            response_text = response_text.strip("`").strip()
+        if response_text.startswith("json"):
+            response_text = response_text[4:].strip()
+
+        links = json.loads(response_text)
+        if isinstance(links, list):
+            # Resolve relative URLs if Gemini returns them
+            resolved_links = [urljoin(current_page_url, link) for link in links]
+            return list(set(resolved_links)) # Use set to remove duplicates
+        else:
+            logger.error(f"Gemini response for links is not a JSON array: {response_text}")
+            return []
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from Gemini for link extraction: {e}. Response: {response_text[:200]}...")
+        return []
+    except Exception as e:
+        logger.error(f"Error calling Gemini API for link extraction: {e}")
+        return []
+
+async def extract_next_page_link_from_markdown_with_gemini(markdown_content: str, current_page_url: str) -> Optional[str]:
+    """
+    Use Gemini API to extract the next page link from markdown content.
+    """
+    prompt = (
+        "Given the following markdown content of a web page, identify and extract the URL for the 'next page' in a pagination sequence. "
+        "Return only the full URL as a string. If no next page link is found, return an empty string or null. "
+        "If the link is relative, resolve it using the current page URL. "
+        "Example: 'https://example.com/page/2'\n\n"
+        f"Markdown Content:\n{markdown_content}"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: geminiClient.models.generate_content(
+                model=config.API_MODEL, # Use API_MODEL from config
+                contents=prompt
+            )
+        )
+        response_text = response.text.strip()
+        # Clean up response (Gemini might wrap in quotes or code blocks)
+        if response_text.startswith("```") and response_text.endswith("```"):
+            response_text = response_text.strip("`").strip()
+        if response_text.startswith("json"): # Sometimes it might return "json\n"
+            response_text = response_text[4:].strip()
+        if response_text.startswith('"') and response_text.endswith('"'): # If it returns a string in quotes
+            response_text = response_text.strip('"')
+
+        if response_text and response_text.lower() != 'null':
+            return urljoin(current_page_url, response_text)
+        return None
+    except Exception as e:
+        logger.error(f"Error calling Gemini API for next page link: {e}")
+        return None
+
+async def filter_article_with_gemini(markdown_content: str) -> Optional[Dict[str, str]]:
+    """
+    Use Gemini API to extract the article title, content, and their English translations from markdown.
+
+    Args:
+        markdown_content (str): Markdown content of the article.
+
+    Returns:
+        Optional[Dict[str, str]]: Dictionary with 'title', 'title_english', 'content', and 'content_english', or None on failure.
+    """
+    prompt = (
+        "Given the following markdown content of an article, "
+        "extract only the article title and the main article content. "
+        "Translate the article title to English. "
+        "Also provide the English translation of the main article content. "
+        "**Ensure all Arabic text in 'title' and 'content' includes appropriate tashkeel (diacritics).** "
+        "Return your answer as a JSON object with keys 'title', 'title_english', 'content', and 'content_english'.\n\n"
+        f"Markdown Content:\n{markdown_content}"
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: geminiClient.models.generate_content(
+                model=config.API_MODEL, # Use API_MODEL from config
                 contents=prompt
             )
         )
@@ -138,16 +183,19 @@ async def filter_article_with_gemini(text_segments: List[str]) -> Optional[Dict[
             response_text = response_text[4:].strip()
 
         filtered = json.loads(response_text)
-        if isinstance(filtered, dict) and "title" in filtered and "content" in filtered:
+        if isinstance(filtered, dict) and "title" in filtered and "content" in filtered and "title_english" in filtered and "content_english" in filtered:
             return filtered
         else:
-            logger.error("Gemini response JSON does not have expected keys.")
+            logger.error(f"Gemini response JSON does not have expected keys or format: {response_text}")
             return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from Gemini for article filtering: {e}. Response: {response_text[:200]}...")
+        return None
     except Exception as e:
-        logger.error(f"Error calling Gemini API: {e}")
+        logger.error(f"Error calling Gemini API for article filtering: {e}")
         return None
 
-async def scrape_all_articles(url: str) -> Dict[str, Dict[str, str]]:
+async def scrape_all_articles(url: str) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
     """
     Scrape all articles from the main lessons page, following pagination,
     and filter each article using Gemini API.
@@ -156,29 +204,37 @@ async def scrape_all_articles(url: str) -> Dict[str, Dict[str, str]]:
         url (str): The URL of the main lessons page.
 
     Returns:
-        Dict[str, Dict[str, str]]: Dictionary mapping article URLs to dicts with 'title' and 'content'.
+        Tuple[Dict[str, Dict[str, str]], List[str]]: Dictionary mapping article URLs to dicts with
+        'title', 'title_english', 'content', 'content_english', and a list of all next page links encountered.
     """
     async with ArabicScraper(url) as scraper:
         results = {}
         page_url = url
         base_url = extract_base_url(page_url)
         visited_articles = set()
+        all_next_page_links = []
         page_num = 1
 
         while page_url:
             logger.info(f"Scraping page: {page_url}")
-            main_html = await scraper.fetch_page(page_url)
-            article_links = await scraper.extract_links_in_section(main_html, ".views-view-grid", base_url)
+            try:
+                main_markdown = await scraper.fetch_page(page_url) # Fetch markdown via Jina AI
+            except Exception as e:
+                logger.error(f"Could not fetch main page {page_url}: {e}")
+                break # Stop if main page cannot be fetched
+
+            # Extract article links from markdown using Gemini
+            article_links = await extract_links_from_markdown_with_gemini(main_markdown, page_url)
             logger.info(f"Found {len(article_links)} articles on page {page_num}.")
 
-            for article_url in article_links:
+            # Use tqdm for progress bar over articles
+            for article_url in tqdm(article_links, desc=f"Processing articles on page {page_num}"):
                 if article_url in visited_articles:
                     continue
                 try:
                     logger.info(f"Scraping article: {article_url}")
-                    article_html = await scraper.fetch_page(article_url)
-                    text_segments = await scraper.extract_text(article_html)
-                    filtered = await filter_article_with_gemini(text_segments)
+                    article_markdown = await scraper.fetch_page(article_url) # Fetch article markdown via Jina AI
+                    filtered = await filter_article_with_gemini(article_markdown)
                     if filtered:
                         results[article_url] = filtered
                     else:
@@ -187,11 +243,13 @@ async def scrape_all_articles(url: str) -> Dict[str, Dict[str, str]]:
                 except Exception as e:
                     logger.error(f"Failed to scrape {article_url}: {e}")
 
-            next_page = await scraper.extract_next_page_link(main_html, "li.pager__item", base_url)#(main_html, "li.pager__item--next a", base_url)
+            # Extract next page link from markdown using Gemini
+            next_page = await extract_next_page_link_from_markdown_with_gemini(main_markdown, page_url)
             if next_page and next_page != page_url:
+                all_next_page_links.append(next_page) # Collect all next page links
                 page_url = next_page
                 page_num += 1
             else:
                 break
 
-        return results
+        return results, all_next_page_links
