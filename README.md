@@ -18,7 +18,7 @@ pip install -r requirements.txt
 ## Running the Project
 
 ```bash
-python src/main.py <url_to_scrape>
+python src/main.py "<url_to_scrape>"
 ```
 
 ## Running the Project with Dummy Data

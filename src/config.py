@@ -1,7 +1,7 @@
 import os
 
 # --- API Settings ---
-API_MODEL = "gemini-1.5-pro" # Gemini API model to use
+API_MODEL = "gemini-2.5-pro" # Gemini API model to use
 
 # --- Paths ---
 # Base directory of the project (one level up from src)
